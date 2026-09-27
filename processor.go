@@ -72,10 +72,13 @@ type inMsg struct {
 	ingestTime time.Time // 入队时刻的处理时间（用于空闲判定，避免异步处理被时钟推进污染）
 }
 
-// barrierReq 是检查点屏障的请求/应答。
+// barrierReq 是检查点屏障的请求/应答。wantSnap 为真时，除检查点外
+// 还在同一屏障点返回与"当前已处理结果"严格对齐的结果订阅快照。
 type barrierReq struct {
-	cp *Checkpoint
-	ch chan error
+	cp       *Checkpoint
+	snap     *ResultSnapshot
+	wantSnap bool
+	ch       chan error
 }
 
 // Processor 是事件流处理管线：单 goroutine 串行持有全部状态，
@@ -92,6 +95,7 @@ type Processor struct {
 	closedOnce      sync.Once
 	logger          *slog.Logger
 	disableIdleTick bool // 测试中使用虚拟时钟时关闭墙钟自动空闲检测
+	store           *ResultStore
 
 	// 以下字段仅由处理循环 goroutine 访问。
 	tracker   *WatermarkTracker
@@ -123,6 +127,7 @@ func NewProcessor(cfg Config, partitions []int) (*Processor, error) {
 		positions:  make(map[int]int64),
 		wm:         NoWatermark,
 		stopCh:     make(chan struct{}),
+		store:      NewResultStore(cfg.ResultHistoryCapacity),
 	}
 	for _, id := range partitions {
 		p.positions[id] = 0
@@ -179,6 +184,9 @@ func (p *Processor) loop(ctx context.Context) {
 			case msg.barrier != nil:
 				cp := p.snapshot()
 				msg.barrier.cp = cp
+				if msg.barrier.wantSnap {
+					msg.barrier.snap = p.store.Snapshot()
+				}
 				msg.barrier.ch <- nil
 			case msg.idleTick:
 				p.applyIdleTick()
@@ -536,6 +544,10 @@ func (p *Processor) Restore(cp *Checkpoint) error {
 	}
 	p.tracker.restoreState(cp.MaxEventTime, cp.Watermark)
 	p.wm = cp.Watermark
+	// 恢复后的进程相当于一次新的结果流：位点序列从 1 重新编号，
+	// 结果历史与物化视图清空，避免与崩溃前进程的记录混叠。
+	// 消费位点语义是进程内的；持久化跨进程续读由订阅者在取快照后续读。
+	p.store = NewResultStore(p.cfg.ResultHistoryCapacity)
 	p.logger.Info("processor restored from checkpoint",
 		"watermark", wmString(cp.Watermark), "windows", len(p.windows), "dedup", p.dedup.Len())
 	return nil
@@ -557,6 +569,9 @@ func (p *Processor) Close() error {
 		close(p.results)
 		close(p.rejections)
 		close(p.verdicts)
+		// 关闭结果订阅存储：所有订阅被唤醒，排空保留范围内剩余结果后收到 io.EOF，
+		// 即使订阅者从不读取，也没有任何后台任务需要回收（拉模型无每订阅者 goroutine）。
+		p.store.Close()
 	})
 	return nil
 }
@@ -579,6 +594,34 @@ func (p *Processor) Wait() { <-p.done }
 
 // Results 返回窗口最终/更正结果通道（关闭时由消费者侧自行 drain 或停止）。
 func (p *Processor) Results() <-chan WindowResult { return p.results }
+
+// SubscribeResults 从上一次确认位点之后订阅窗口结果：返回的订阅首先交付
+// Seq=after+1 的结果。after=0 从头订阅。结果按位点严格有序，FINAL/UPDATE
+// 的先后关系与产生顺序完全一致；订阅为纯拉取，不建立后台 goroutine/队列。
+//
+// 若 after+1 已滑出有界保留范围，返回包装了 ErrResultPositionExpired 的错误，
+// 调用方应改用 ResultSnapshot 取完整视图后从快照位点续读。
+func (p *Processor) SubscribeResults(after ResultSeq) (*Subscription, error) {
+	return p.store.Subscribe(after)
+}
+
+// ResultSnapshot 在串行处理流中插入屏障，返回与"当前已处理结果"严格对齐的
+// 完整结果视图（每个窗口最新值，确定性排序）。视图应用后，用
+// SubscribeResults(snap.Seq) 续读 Seq>snap.Seq 的全部增量；
+// 快照+增量与从不掉线一直消费得到的结果逐窗口逐字段一致。
+func (p *Processor) ResultSnapshot(ctx context.Context) (*ResultSnapshot, error) {
+	req := &barrierReq{wantSnap: true, ch: make(chan error, 1)}
+	if err := p.send(ctx, inMsg{barrier: req}); err != nil {
+		return nil, err
+	}
+	if err := <-req.ch; err != nil {
+		return nil, err
+	}
+	return req.snap, nil
+}
+
+// ResultStore 暴露底层有界结果存储（供测试与需要直接取非屏障快照的调用方使用）。
+func (p *Processor) ResultStore() *ResultStore { return p.store }
 
 // Rejections 返回超宽限迟到事件的侧输出通道。
 func (p *Processor) Rejections() <-chan LateRejection { return p.rejections }
@@ -616,6 +659,10 @@ func (p *Processor) sendResult(ctx context.Context, r WindowResult) {
 	case <-ctx.Done():
 	case <-p.stopCh:
 	case p.results <- r:
+		// 仅在结果确已交付到旧输出面（Results 通道）后再登记到订阅历史，
+		// 保证两个输出面看到的结果集合一致，订阅历史不会多出"未交付"结果。
+		// 追加为 O(1) 且不阻塞，慢订阅者的等待不影响处理循环。
+		p.store.Append(r)
 	}
 }
 

@@ -110,7 +110,51 @@ func main() {
 	must(proc2.Ingest(ctx, ev(0, 6, "BTC", 1_500, 99, 9)))
 
 	must(proc2.MarkComplete(ctx, 2))
-	_, _ = proc2.Checkpoint(ctx) // 屏障，确保全部处理完
+	_, _ = proc2.Checkpoint(ctx) // 屏障，确保全部结果已进入历史
+
+	// ---- 结果订阅演示 ----
+	// 1) 新订阅者取当前完整快照（屏障点，与已处理结果对齐），仅展示完整视图。
+	snap, err := proc2.ResultSnapshot(ctx)
+	must(err)
+	fmt.Printf(">>> result snapshot at seq=%d (wm=%s): %d windows\n",
+		snap.Seq, wm(snap.Watermark), len(snap.Views))
+	for _, rec := range snap.Views {
+		fmt.Printf("    [SNAP %d] %s %s count=%d vwap=%.4f\n",
+			rec.Seq, rec.Result.Kind, rec.Result.Window, rec.Result.Agg.EventCount, rec.Result.Agg.VWAP())
+	}
+
+	// 2) 掉线/重连 + 重复补发演示：从头订阅，收到第一条后记录 Ack；
+	//    再故意从 ack-1 重订阅：seq=ack 被重复补发（applied=false），
+	//    其余结果各生效一次，更正（UPDATE）按位点在 FINAL 之后生效、绝不旧盖新。
+	mat := marketstream.NewResultMaterializer()
+	total := int(snap.Seq) // 屏障时的结果总数
+	sub, err := proc2.SubscribeResults(0)
+	must(err)
+	rec0, rerr := sub.Receive(ctx)
+	must(rerr)
+	mat.Apply(rec0)
+	ack := sub.Ack()
+	sub.Close()
+	fmt.Printf(">>> subscriber got seq=%d then disconnected (ack=%d)\n", rec0.Seq, ack)
+
+	replay, err := proc2.SubscribeResults(ack - 1)
+	must(err)
+	for i := 0; i < total-int(ack-1); i++ {
+		rec, rerr := replay.Receive(ctx)
+		must(rerr)
+		applied := mat.Apply(rec)
+		fmt.Printf("    [SUB %d] %s %s count=%d vwap=%.4f applied=%v\n",
+			rec.Seq, rec.Result.Kind, rec.Result.Window, rec.Result.Agg.EventCount, rec.Result.Agg.VWAP(), applied)
+	}
+	replay.Close()
+
+	// 3) 订阅侧重放（含一次重复补发）后的物化视图，与上面快照逐窗口一致。
+	fmt.Printf(">>> subscriber materialized view after resume (dedup applied):\n")
+	for _, rec := range snap.Views {
+		fmt.Printf("    [VIEW] %s %s count=%d vwap=%.4f\n",
+			rec.Result.Kind, rec.Result.Window, rec.Result.Agg.EventCount, rec.Result.Agg.VWAP())
+	}
+
 	must(proc2.Close())
 	proc2.Wait()
 	<-done2
