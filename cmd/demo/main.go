@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/xingjianluo/market-event-stream-go"
 )
@@ -114,7 +115,144 @@ func main() {
 	must(proc2.Close())
 	proc2.Wait()
 	<-done2
+
+	demoResultBus()
 	fmt.Println(">>> demo finished")
+}
+
+// demoResultBus 演示“可断点续读的结果订阅与审计回放”层：
+//  1. 总线为每条窗口结果分配稳定单调位点；
+//  2. 订阅者处理若干条后掉线，用已确认位点重连续读，不重不漏；
+//  3. 新订阅者先取完整快照，再从快照边界接增量，结论与连续消费一致；
+//  4. 订阅者落后超过可保留范围时得到明确的 ErrPositionExpired，可重新取快照恢复。
+func demoResultBus() {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	cfg := marketstream.DefaultConfig()
+	cfg.Logger = logger
+	cfg.MaxOutOfOrderness = 0
+	cfg.AllowedLateness = 50_000
+	partitions := []int{0, 1}
+
+	proc, err := marketstream.NewProcessor(cfg, partitions)
+	must(err)
+	bcfg := marketstream.DefaultResultBusConfig()
+	bcfg.HistoryCapacity = 8 // 故意调小，演示有界回放与溢出结论
+	bus, err := marketstream.NewResultBus(bcfg)
+	must(err)
+	must(proc.Start(ctx))
+	must(bus.Attach(proc))
+
+	// 审计订阅：从位点 0 开始完整消费，用作“从未断线”的参照视图。
+	auditor, err := bus.Subscribe(0)
+	must(err)
+
+	// 业务订阅：先消费 3 条结果，记录确认位点后“掉线”。
+	app, err := bus.Subscribe(0)
+	must(err)
+	events := []marketstream.Event{
+		ev(0, 0, "BTC", 1_000, 100, 2),
+		ev(1, 0, "BTC", 2_000, 105, 1),
+		ev(0, 1, "BTC", 5_000, 110, 3),
+		ev(1, 1, "BTC", 11_000, 108, 4),
+		ev(0, 2, "BTC", 21_000, 130, 1),
+		ev(1, 2, "BTC", 22_000, 135, 2), // 推进 wm=21000，触发 w0/w1 FINAL
+		ev(0, 3, "BTC", 12_000, 120, 1), // w1 更正
+		ev(0, 4, "BTC", 3_000, 95, 1),   // w0 更正
+	}
+	for _, e := range events {
+		must(proc.Ingest(ctx, e))
+	}
+
+	printNext := func(tag string, s *marketstream.Subscription, n int) marketstream.Position {
+		var committed marketstream.Position
+		for i := 0; i < n; i++ {
+			r, err := s.Next(ctx)
+			if err != nil {
+				fmt.Printf("[%s] next error: %v\n", tag, err)
+				return committed
+			}
+			fmt.Printf("[%s] pos=%d %s %s count=%d qty=%d\n",
+				tag, r.Position, r.Result.Kind, r.Result.Window,
+				r.Result.Agg.EventCount, r.Result.Agg.TotalQty)
+			committed = s.Ack(r.Position)
+		}
+		return committed
+	}
+
+	checkpoint := printNext("app-online", app, 3)
+	fmt.Printf("[app] processed 3, committed position=%d; simulating disconnect ...\n", checkpoint)
+	must(app.Close())
+
+	// 重连：从已确认位点继续，只拿到之后的结果。
+	app2, err := bus.Subscribe(checkpoint)
+	must(err)
+	for {
+		r, err := app2.Next(ctx)
+		if err != nil {
+			break
+		}
+		fmt.Printf("[app-resume] pos=%d %s %s count=%d\n",
+			r.Position, r.Result.Kind, r.Result.Window, r.Result.Agg.EventCount)
+		app2.Ack(r.Position)
+		if bus.CurrentPosition() == r.Position {
+			break
+		}
+	}
+
+	// 新订阅者：先取快照视图，再从快照边界接增量。
+	snap := bus.Snapshot()
+	fmt.Printf("[new-sub] snapshot at position=%d oldest=%d windows=%d\n",
+		snap.Position, snap.Oldest, len(snap.Windows))
+	for _, w := range snap.Windows {
+		fmt.Printf("[new-sub] snapshot view %s %s count=%d (last pos=%d)\n",
+			w.Result.Kind, w.Result.Window, w.Result.Agg.EventCount, w.Position)
+	}
+	fresh, err := bus.Subscribe(snap.Position)
+	must(err)
+	// 快照边界即当前尾端：此刻没有更新的结果，Next 会阻塞等待（这正是“续读”语义）。
+	// 用一个短超时上下文演示该行为而不挂起。
+	waitCtx, cancelWait := context.WithTimeout(ctx, 50*time.Millisecond)
+	if _, err := fresh.Next(waitCtx); err != nil {
+		fmt.Printf("[new-sub] caught up at snapshot boundary; Next blocks for new results (%v)\n", err)
+	}
+	cancelWait()
+	must(fresh.Close())
+
+	// 演示溢出：再制造足够多结果把小容量历史轮转越过审计订阅的进度。
+	go func() {
+		for i := int64(0); i < 20; i++ {
+			_ = proc.Ingest(ctx, ev(int(i%2), 100+i, "BTC", 30_000+i*10_000, 100, 1))
+		}
+		_ = proc.MarkComplete(ctx, 0)
+		_ = proc.MarkComplete(ctx, 1)
+	}()
+	// auditor 故意不读，直到历史轮转越界，得到明确、可区分的结论。
+	for {
+		_, err := auditor.Next(ctx)
+		if err != nil {
+			fmt.Printf("[auditor] stopped with distinguishable error: %v\n", err)
+			break
+		}
+	}
+	// 恢复方式：重新取快照 + 从快照边界续读（此处管线已 EOF，演示错误判定即可）。
+	if _, err := bus.Subscribe(0); err != nil {
+		fmt.Printf("[recover] subscribing at expired position rejected as expected: %v\n", err)
+	}
+	recoverySnap := bus.Snapshot()
+	rec, err := bus.Subscribe(recoverySnap.Position)
+	if err != nil {
+		fmt.Printf("[recover] subscribe at snapshot boundary: %v\n", err)
+	} else {
+		fmt.Printf("[recover] re-attached at snapshot boundary=%d (history still covers it)\n",
+			recoverySnap.Position)
+		_ = rec.Close()
+	}
+
+	must(proc.Close())
+	proc.Wait()
+	bus.Wait()
+	must(app2.Close())
 }
 
 func ev(part int, off int64, symbol string, ts int64, price float64, qty int64) marketstream.Event {

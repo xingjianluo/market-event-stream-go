@@ -2,7 +2,7 @@
 
 一个纯本地、零外部依赖的事件流处理管线，用内存分区事件源模拟多分区行情，
 演示并验证：**按事件时间的多分区窗口聚合、水位线推进、迟到处理、幂等去重、
-有界背压与检查点故障恢复**。
+有界背压、检查点故障恢复，以及可断点续读的结果订阅与审计回放**。
 
 核心目标：让乱序、重复、迟到、分区交错、到达顺序/批大小变化与故障重放，
 都得到**一致且可解释**的聚合结论。
@@ -92,7 +92,88 @@ go test -race -count=1 -v ./...
   **重放后的结果与无故障运行逐窗口一致**（见
   `TestCheckpointRestoreReplayEqualsFaultFree`）。
 
-## 六、可配置项（`Config`）
+## 六、可断点续读的结果订阅与审计回放（ResultBus）
+
+在处理器 `Results()` 通道之上提供一层**独立、非侵入**的结果总线 `ResultBus`：
+处理器的窗口/水位线/迟到/背压/检查点语义完全不变（它只是被挂接的结果通道的消费者），
+总线额外提供**稳定位点订阅、断线续读、完整快照 + 增量、有界回放与容量保护**。
+
+### 6.1 位点与订阅语义
+
+- 总线只有一个后台 goroutine 顺序消费处理器结果，为每条 `WindowResult` 分配一个
+  **全局单调、严格按发出顺序**的整数位点 `Position`（第一条为 1，`0` 表示从头）。
+- `Subscribe(from)` 严格交付序号 **> from** 的结果：
+  - 订阅者只需把「最后处理完的位点」持久化（`Ack` 仅做本地记账，幂等、单调取最大、
+    可重复调用）；掉线/进程重启后用该位点重新订阅即可**只拿到之后的结果**；
+  - `from` 晚于当前尾端时**不夹取也不跳结果**：保留该绝对位点并阻塞等待，
+    直到日志推进到那里（支持总线刚启动就携带外部已提交位点提前注册）；
+  - 因为位点序与发出序一致，同一窗口的 `FINAL -> UPDATE -> UPDATE` 更正链先后关系
+    天然保留，**不会旧值盖新值**；单个订阅生命周期内同一位点**只交付一次**，
+    不会重复应用（重连用新订阅从已确认位点开始）。
+- `Next(ctx)` 为拉模型：赶上尾端时阻塞等待新结果（可用 ctx 超时/取消中断，订阅仍有效）；
+  返回值结论始终**可区分**，见下表，绝不静默漏结果或悄悄跳过。
+
+| 返回 | 含义与恢复动作 |
+|------|----------------|
+| `SequencedResult` | 正常交付，位点严格递增 |
+| `ErrPositionExpired` | 进度已被有界历史轮转越过：**重新 `Snapshot()`，应用视图后从快照边界续读** |
+| `ErrBusClosed` | 上游结果通道已关闭且保留结果已排空（关闭前会先排空） |
+| `ErrSubscriptionClosed` | 本订阅已 `Close()` |
+| `context 错误` | 等待期间被取消/超时；订阅仍有效，可继续 `Next` 或稍后重连 |
+| `ErrTooManySubscribers` | 在线订阅者达到 `MaxSubscribers` 上限 |
+
+### 6.2 快照与增量的严格一致关系
+
+`Snapshot()` 在当前日志尾端（位点 `S`）给出一个一致性完整视图：每个窗口在
+`<= S` 范围内的**最新一条结果**（FINAL 或最后一条 UPDATE），并返回边界 `S` 与
+当时可回放的最旧位点 `Oldest`。恢复方：
+
+1. 应用快照：把 `Windows` 按窗口身份装入自己的物化视图；
+2. `Subscribe(S)`：严格接收序号 `> S` 的增量，按窗口折叠（位点大者覆盖小者）。
+
+不变式：**快照视图 + 边界后增量 == 从不断线、从序号 1 连续消费折叠出的视图**，
+逐字段严格一致（窗口身份、FINAL/UPDATE 更正关系、`EventCount/TotalQty/Notional/
+FirstTime/LastTime` 全部用 `==` 比对，不用近似相等）。
+新订阅者或落后太多的订阅者因此不必回放全部历史，先取快照即可廉价追平。
+
+### 6.3 有界回放与容量保护
+
+- 结果历史是**定容环形缓冲**（`HistoryCapacity`，按条数），运行时间再长也只保留
+  最近 N 条；同时维护「每窗口位点 FIFO + 最新视图」，其总条目恒等于历史条数，内存有界。
+- 订阅**不缓存结果**，读取直接命中共享历史；后台 goroutine 恒为 1 个，
+  订阅者再多（`<= MaxSubscribers`）、再慢或完全不读，都**不会**增加内存或后台任务，
+  也**不会反压处理管线**（处理器原有背压仅取决于它自己的有界通道，语义不变）。
+- 历史轮转越过某订阅进度时，总线**主动摘除**该订阅；它的下一次 `Next/Subscribe`
+  得到明确的 `ErrPositionExpired`，恢复方式就是「重新取快照 + 从快照边界续读」，
+  不会静默漏掉一条结果。
+- 即使所有订阅者都不读，处理器 `Close()` 后结果通道关闭，总线排空残余（仅 O(通道缓冲)）
+  后在**有限时间内**停止并回收 goroutine（见 `TestE2EFiniteStopWithIdleSubscriber`）。
+
+### 6.4 用法要点
+
+```go
+bus, _ := marketstream.NewResultBus(marketstream.DefaultResultBusConfig())
+proc, _ := marketstream.NewProcessor(cfg, parts)
+proc.Start(ctx)
+bus.Attach(proc) // 挂接后由总线独占消费 Results()
+
+sub, _ := bus.Subscribe(committed) // 重启时传入上次持久化的位点
+for {
+    r, err := sub.Next(ctx)
+    if errors.Is(err, marketstream.ErrPositionExpired) {
+        snap := bus.Snapshot()        // 落后太多：先取快照
+        applyView(snap.Windows)       // 装入完整视图
+        sub, _ = bus.Subscribe(snap.Position) // 再从边界续读
+        continue
+    }
+    // ... 处理 r.Result ...
+    committed = sub.Ack(r.Position)   // 持久化 committed
+}
+```
+
+## 七、可配置项
+
+### 7.1 处理管线（`Config`）
 
 | 字段 | 单位 | 默认 | 含义 |
 |------|------|------|------|
@@ -106,7 +187,15 @@ go test -race -count=1 -v ./...
 | `Clock` | — | 系统时钟 | 处理时间来源（可注入虚拟时钟） |
 | `Logger` | — | stdout | `slog` 结构化日志 |
 
-## 七、代码结构
+### 7.2 结果总线（`ResultBusConfig`）
+
+| 字段 | 单位 | 默认 | 含义 |
+|------|------|------|------|
+| `HistoryCapacity` | 条数 | 4096 | 有界结果历史长度：决定可回放范围、慢订阅容忍度与快照覆盖窗口数；0 取默认 |
+| `MaxSubscribers` | 个 | 256 | 同时在线订阅者上限，超出 `Subscribe` 返回 `ErrTooManySubscribers`；0 取默认 |
+| `Logger` | — | 丢弃 | 结果总线的 `slog` 日志 |
+
+## 八、代码结构
 
 | 文件 | 职责 |
 |------|------|
@@ -117,26 +206,45 @@ go test -race -count=1 -v ./...
 | `source.go` | 内存分区事件源，支持偏移 `Seek` 回放（带锁，可并发分区读取） |
 | `processor.go` | 串行处理循环、判定、窗口触发、背压、屏障、恢复、输出通道 |
 | `checkpoint.go` | 检查点结构、JSON 原子持久化与 ID 编解码 |
+| `resultbus.go` | 稳定位点、有界环形历史、按位点订阅/确认、快照视图与溢出摘除 |
 | `config.go` / `clock.go` | 配置校验与时钟抽象 |
-| `cmd/demo/main.go` | 端到端演示 |
+| `cmd/demo/main.go` | 端到端演示（含结果订阅/快照/溢出恢复段落） |
 
-## 八、本地验证与测试场景
+## 九、本地验证与测试场景
 
 ```bash
+# 常规
 go test -race -count=1 -v ./...
+
+# 仅结果订阅/回放层（直接向总线投喂结果，快速且确定）
+go test -race -count=1 -v -run 'TestBus|TestSubscription|TestSnapshot|TestSlowSubscriber|TestMaxSubscribers|TestBoundedHistory'
+
+# 与真实处理器端到端集成（交错/快照续读/故障重放/容量回收）
+go test -race -count=1 -v -run 'TestE2E'
+
+# 可观察演示（最后一段输出 app-online / app-resume / new-sub / auditor / recover）
+go run ./cmd/demo
 ```
 
-覆盖场景与失败可区分性：
+结果订阅/回放相关用例：
 
-- `TestInterleavingOrderAndBatchIndependent`：3 种不同交错/批大小顺序结果逐字段一致。
-- `TestWatermark*`：多分区最小值、单调不回退、空闲解除阻塞、全完成到 +∞。
-- `TestDuplicateDeliveryNotCounted`：穿插重复投递，笔数/量/金额不重复计入。
-- `TestLateDataWithinAndBeyondGrace`：同批中区分 `LATE_UPDATE` 与 `DROPPED_LATE`。
-- `TestIdlePartitionUnblocksWindowFinishing`：超时前不关窗、超时后解除、恢复不回退。
-- `TestBoundedInputQueueBackpressure` / `TestBoundedFeederGoroutines`：队列严格有界、
-  生产者确实被阻塞、突发下 goroutine 数稳定。
-- `TestCheckpointRestoreReplayEqualsFaultFree`：崩溃恢复 + 强制重放已提交事件，
-  结果与无故障一致，重放事件判为 DUPLICATE。
+- `TestBusAssignsStableMonotonicPositions`：位点从 1 单调，同窗口 FINAL/UPDATE 成链不乱序。
+- `TestSubscriptionResumeAfterDisconnect`：掉线后用已确认位点续读，不重不漏、赶上后阻塞等待。
+- `TestDuplicateAckIdempotent`：重复/乱序确认单调取最大；同一位点在单订阅内不补发两次。
+- `TestSnapshotPlusIncrementalEqualsContinuous` / `TestSnapshotAfterRotationInvariant`：
+  快照 + 增量与连续消费**逐字段严格一致**；轮转后不变式仍成立。
+- `TestSlowSubscriberOverflowAndRecovery`：不读的慢订阅者被主动摘除并得到
+  `ErrPositionExpired`，其他订阅与管线不受影响，重新取快照可无损恢复。
+- `TestMaxSubscribersCap` / `TestBoundedHistoryRetention`：订阅者数与历史长度严格有界。
+- `TestBusDrainsHistoryAfterClose` / `TestE2EFiniteStopWithIdleSubscriber`：
+  关闭后排空保留结果再给 `ErrBusClosed`；订阅者全不读也能有限时间停止并回收 goroutine。
+- `TestE2EInterleavingBatchStrictConsistency`：同一批事件在不同分区交错/批大小下，
+  总线位点流折叠视图逐字段一致。
+- `TestE2EDeterministicCorrectionChain`：真实处理器下确定性的 FINAL→UPDATE 更正链。
+- `TestE2ESnapshotResumeEqualsContinuous`：真实处理器运行中快照 + 增量与连续消费严格一致。
+- `TestE2EFaultReplayViewConsistency`：检查点崩溃恢复并强制重放已提交事件后，
+  新总线视图与无故障运行一致，重放事件判为 DUPLICATE。
+- `TestE2EBurstBoundedGoroutines`：突发流量下后台 goroutine 数稳定。
 
-所有测试通过 `slog` 打印水位线（含 `-inf/+inf`）、事件时间、窗口与判定原因，
-失败断言会指出具体不一致的窗口、聚合字段或判定类别，便于区分根因。
+原有用例（窗口、水位线、迟到、去重、背压、检查点恢复）全部保留且不回归，
+默认配置与 `NewProcessor/Start/Ingest/Results/Checkpoint/Restore/Close` 等既有调用方式不变。
