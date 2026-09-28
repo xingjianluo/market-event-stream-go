@@ -168,6 +168,22 @@ func waitForVerdicts(t *testing.T, c *collector, n int) {
 	t.Fatalf("waitForVerdicts timeout: got %d, want %d", len(c.Verdicts()), n)
 }
 
+// waitForRejections 轮询等待收集到至少 n 条侧输出，超时即失败。
+func waitForRejections(t *testing.T, c *collector, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		got := len(c.rejections)
+		c.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("waitForRejections timeout: got %d, want %d", len(c.Rejections()), n)
+}
+
 // runProcessor 启动处理器并收集输出，返回清理函数（屏障+关闭+等待收集结束）。
 func runProcessor(ctx context.Context, t *testing.T, cfg Config, parts []int) (*Processor, *collector, func()) {
 	t.Helper()

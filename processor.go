@@ -639,10 +639,18 @@ func (p *Processor) CurrentWatermark(ctx context.Context) (int64, error) {
 }
 
 func (p *Processor) emitVerdict(ctx context.Context, v Verdict) {
-	select {
-	case <-ctx.Done():
-	case <-p.stopCh:
-	case p.verdicts <- v:
+	// 订阅专用模式下判定通道只是旁路：尽力而为、绝不阻塞处理循环。
+	if p.cfg.ResultOutputMode == ResultOutputSubscriptionOnly {
+		select {
+		case p.verdicts <- v:
+		default:
+		}
+	} else {
+		select {
+		case <-ctx.Done():
+		case <-p.stopCh:
+		case p.verdicts <- v:
+		}
 	}
 	p.logger.LogAttrs(ctx, slog.LevelInfo, "event decision",
 		slog.String("event", v.Event.String()),
@@ -655,6 +663,17 @@ func (p *Processor) emitVerdict(ctx context.Context, v Verdict) {
 }
 
 func (p *Processor) sendResult(ctx context.Context, r WindowResult) {
+	if p.cfg.ResultOutputMode == ResultOutputSubscriptionOnly {
+		// 订阅专用模式：ResultStore 是权威输出面。先登记历史（O(1)、绝不阻塞），
+		// 保证只走订阅、完全不读旧通道时结果也按位点持续交付、屏障/快照/关闭不卡。
+		// 旧 Results 通道退化为尽力而为的旁路，缓冲满即丢，不影响权威订阅面。
+		p.store.Append(r)
+		select {
+		case p.results <- r:
+		default:
+		}
+		return
+	}
 	select {
 	case <-ctx.Done():
 	case <-p.stopCh:
@@ -667,6 +686,13 @@ func (p *Processor) sendResult(ctx context.Context, r WindowResult) {
 }
 
 func (p *Processor) sendRejection(ctx context.Context, r LateRejection) {
+	if p.cfg.ResultOutputMode == ResultOutputSubscriptionOnly {
+		select {
+		case p.rejections <- r:
+		default:
+		}
+		return
+	}
 	select {
 	case <-ctx.Done():
 	case <-p.stopCh:

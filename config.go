@@ -29,11 +29,31 @@ type Config struct {
 	// 不随运行时间无限增长）；为 0 时使用默认容量。慢订阅者落后超出该范围后，
 	// 订阅返回 ErrResultPositionExpired，需改取快照后续读。
 	ResultHistoryCapacity int
+	// ResultOutputMode 选择窗口结果的输出面语义：
+	//   - ResultOutputLive（默认，零值亦视为默认）：原有 Results()/Rejections()/
+	//     Verdicts() 通道是输出面，下游停滞时按有界通道向生产者背压；
+	//     结果在写入 Results 通道后登记到订阅历史（兼容旧用法）。
+	//   - ResultOutputSubscriptionOnly：结果订阅面（SubscribeResults/ResultSnapshot）
+	//     为权威输出，结果先 O(1) 登记有界 ResultStore，处理循环绝不等待旧通道，
+	//     因而完全不消费旧通道也能独立工作；旧通道退化为尽力而为的旁路
+	//     （缓冲满即丢，不可用于权威消费），侧输出/判定同理。
+	ResultOutputMode ResultOutputMode
 	// Clock 注入处理时间；为 nil 时使用系统墙上时钟。
 	Clock Clock
 	// Logger 注入结构化日志；为 nil 时输出到 stdout。
 	Logger *slog.Logger
 }
+
+// ResultOutputMode 选择窗口结果的输出面语义（见 Config.ResultOutputMode）。
+type ResultOutputMode string
+
+const (
+	// ResultOutputLive 是默认模式：原有通道为输出面、保留有界背压语义。
+	ResultOutputLive ResultOutputMode = ""
+	// ResultOutputSubscriptionOnly 是订阅专用模式：ResultStore 为权威结果输出面，
+	// 处理循环不因旧输出通道阻塞，只走订阅、完全不读旧通道也能独立工作。
+	ResultOutputSubscriptionOnly ResultOutputMode = "SUBSCRIPTION_ONLY"
+)
 
 // DefaultConfig 返回面向本地演示与测试的默认配置：
 // 10 秒窗口、2 秒乱序容忍、5 秒迟到宽限、2 秒空闲超时、有界队列。
@@ -47,6 +67,7 @@ func DefaultConfig() Config {
 		ResultBufferSize:      64,
 		RejectBufferSize:      64,
 		ResultHistoryCapacity: defaultResultHistoryCapacity,
+		ResultOutputMode:      ResultOutputLive,
 		Clock:                 wallClock{},
 		Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelInfo,
@@ -76,6 +97,11 @@ func (c Config) Validate(partitions []int) error {
 	}
 	if c.ResultHistoryCapacity < 0 {
 		return fmt.Errorf("%w: ResultHistoryCapacity must be >= 0, got %d", errInvalidConfig, c.ResultHistoryCapacity)
+	}
+	switch c.ResultOutputMode {
+	case ResultOutputLive, ResultOutputSubscriptionOnly:
+	default:
+		return fmt.Errorf("%w: invalid ResultOutputMode %q", errInvalidConfig, c.ResultOutputMode)
 	}
 	if c.Clock == nil {
 		return fmt.Errorf("%w: Clock must not be nil", errInvalidConfig)

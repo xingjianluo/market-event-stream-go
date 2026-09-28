@@ -99,6 +99,8 @@ func TestLateDataWithinAndBeyondGrace(t *testing.T) {
 	}
 
 	// 侧输出必须可观测且带明确原因（不静默丢弃）。
+	// 屏障只保证侧输出已写入通道，collector 是独立 goroutine，等其排空再断言。
+	waitForRejections(t, col, 1)
 	rej := col.Rejections()
 	if len(rej) != 1 {
 		t.Fatalf("want exactly 1 side-output rejection, got %d: %+v", len(rej), rej)

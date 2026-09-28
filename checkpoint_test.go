@@ -77,6 +77,9 @@ func TestCheckpointRestoreReplayEqualsFaultFree(t *testing.T) {
 	done := p2.Feed(ctx, src)
 	<-done
 	waitForResults(t, col2, 2)
+	// 恢复后投递：重放的 1 条 + p1 剩余 2 条，共 3 条判定；
+	// 等 collector 排空，避免屏障后异步收集造成的抖动。
+	waitForVerdicts(t, col2, 3)
 
 	got := make(map[WindowKey]Aggregate)
 	for k, r := range col2.finalResults() {
