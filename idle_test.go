@@ -56,6 +56,7 @@ func TestIdlePartitionUnblocksWindowFinishing(t *testing.T) {
 	// p1 恢复并来一条 t=6000 的迟到事件：当前 wm=18000，dropBoundary=13000，
 	// 窗口结束 10000 <= 13000 => 超出宽限，明确转入侧输出而非静默丢弃。
 	p.Ingest(ctx, mkEvent(1, 1, "BTC", 6_000, 300, 5))
+	waitForRejections(t, col, 1) // 侧输出经接力异步投递
 	waitForVerdicts(t, col, 4)
 	last := col.Verdicts()[3]
 	if last.Decision != DecisionDroppedLate {

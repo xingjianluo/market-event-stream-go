@@ -7,18 +7,19 @@ import (
 	"time"
 )
 
-// TestBoundedInputQueueBackpressure 确定性地验证慢消费者下的背压：
-// 处理循环在向无缓冲、无人读取的结果通道发送 FINAL 时停住，
-// 随后输入队列必然填满，生产者被阻塞而内存/任务不增长。
-// 这里不启动任何输出收集器，等价于完全停滞的慢消费者。
-func TestBoundedInputQueueBackpressure(t *testing.T) {
+// TestBoundedResourcesWithNonReadingDownstream 确定性地验证：完全不消费任何输出
+// （旧通道与订阅面都不读）时，处理链路既不被卡死，也不被无界拖垮——
+// 处理循环持续推进，结果只保留在有界结果历史（环形定容）中，输入队列严格有界，
+// 且后台任务数量恒定。背压的有界点是"有界历史 + 有界输入队列"，而非阻塞处理循环。
+func TestBoundedResourcesWithNonReadingDownstream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cfg := testConfig(t)
 	cfg.MaxOutOfOrderness = 0
-	cfg.InputQueueCapacity = 1
-	cfg.ResultBufferSize = 0 // 结果通道无缓冲且本测试不读取
+	cfg.InputQueueCapacity = 4
+	cfg.ResultBufferSize = 0 // 旧结果通道无缓冲，且本测试完全不读取
 	cfg.RejectBufferSize = 0
+	cfg.ResultHistoryCapacity = 8 // 结果历史极小，制造确定的有界上界
 
 	p, err := NewProcessor(cfg, []int{0})
 	if err != nil {
@@ -29,37 +30,112 @@ func TestBoundedInputQueueBackpressure(t *testing.T) {
 	}
 	defer func() { _ = p.Close(); p.Wait() }()
 
-	// 第一条：窗口未结束、无输出，循环不阻塞，立即处理完。
-	if err := p.Ingest(ctx, mkEvent(0, 0, "BTC", 0, 100, 1)); err != nil {
-		t.Fatalf("ingest first: %v", err)
+	// 不建立任何订阅、不读取 Results/Rejections/Verdicts，等价于完全停滞的下游。
+	// 每条事件推进水位线并最终化一个新窗口，产生大量结果；循环必须始终推进，
+	// 不能因为无人消费输出而停住。
+	const n = 200
+	for i := int64(0); i < n; i++ {
+		done := make(chan error, 1)
+		go func() { done <- p.Ingest(ctx, mkEvent(0, i, "X", (i+1)*10_000, 10, 1)) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("ingest %d blocked: pipeline stalled without any output consumer", i)
+		}
 	}
-	// 第二条使 wm=10000，触发 BTC@[0,10000) 的 FINAL；
-	// 结果通道无缓冲且无人读取 -> 循环在此确定停住。
-	if err := p.Ingest(ctx, mkEvent(0, 1, "ETH", 10_000, 10, 1)); err != nil {
-		t.Fatalf("ingest wm event: %v", err)
+	if err := p.MarkComplete(ctx, 0); err != nil {
+		t.Fatal(err)
 	}
-	// 等待循环卡在结果发送处。
-	time.Sleep(30 * time.Millisecond)
 
-	// 再多投递：输入队列容量 1 且循环停滞，必须阻塞形成背压。
-	over := make(chan error, 1)
-	go func() { over <- p.Ingest(ctx, mkEvent(0, 2, "ETH", 20_000, 10, 1)) }()
+	// 屏障在无人读取任何输出时仍能在有限时间完成，证明处理循环没有卡在输出上。
+	done := make(chan *Checkpoint, 1)
+	go func() { cp, _ := p.Checkpoint(ctx); done <- cp }()
 	select {
-	case err := <-over:
-		t.Fatalf("ingest must block under backpressure, returned early: %v", err)
-	case <-time.After(50 * time.Millisecond):
-		// 预期阻塞：队列严格有界。
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("checkpoint blocked without any output consumer")
 	}
-	if n := len(p.in); n > cap(p.in) {
-		t.Fatalf("input queue grew beyond cap: len=%d cap=%d", n, cap(p.in))
+
+	// 资源严格有界：历史条数不超过容量，输入队列不超过容量。
+	st := p.ResultStore()
+	st.mu.Lock()
+	hist := st.count
+	ringCap := len(st.ring)
+	st.mu.Unlock()
+	if hist > ringCap {
+		t.Fatalf("result history %d exceeded bounded capacity %d", hist, ringCap)
 	}
-	cancel()
+	if q := len(p.in); q > cap(p.in) {
+		t.Fatalf("input queue %d exceeded cap %d", q, cap(p.in))
+	}
+	t.Logf("bounded resources verified with no readers: history=%d/%d, input cap=%d",
+		hist, ringCap, cap(p.in))
+}
+
+// TestNonReadingLegacyOutputDoesNotBlockSubscription 验证：只走订阅面、完全不消费
+// 旧 Results() 通道时，结果持续产生（远超旧通道缓冲）也不会卡住处理链路；
+// 订阅按位点继续交付，且取快照/检查点/关闭都能在有限时间返回。
+func TestNonReadingLegacyOutputDoesNotBlockSubscription(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := testConfig(t)
+	cfg.MaxOutOfOrderness = 0
+	cfg.ResultBufferSize = 1 // 旧结果通道缓冲极小，且本测试完全不读取
+	cfg.ResultHistoryCapacity = 64
+
+	p, err := NewProcessor(cfg, []int{0})
+	if err != nil {
+		t.Fatalf("NewProcessor: %v", err)
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Close(); p.Wait() }()
+
+	sub, err := p.SubscribeResults(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 产生远超旧通道缓冲（=1）的结果量；旧通道无人消费。
+	const n = 20
+	for i := int64(0); i < n; i++ {
+		if err := p.Ingest(ctx, mkEvent(0, i, "X", (i+1)*10_000, 10, 1)); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+	}
+	if err := p.MarkComplete(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// 订阅按位点严格继续交付全部结果。
+	recs := receiveN(t, sub, n)
+	for i, rec := range recs {
+		if rec.Seq != ResultSeq(i+1) {
+			t.Fatalf("seq[%d]=%d want %d (subscription stalled)", i, rec.Seq, i+1)
+		}
+	}
+
+	// 屏障：快照与检查点必须在有限时间内完成。
+	barrierDone := make(chan struct{}, 2)
+	go func() { _, _ = p.ResultSnapshot(ctx); barrierDone <- struct{}{} }()
+	go func() { _, _ = p.Checkpoint(ctx); barrierDone <- struct{}{} }()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-barrierDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("snapshot/checkpoint blocked with unconsumed legacy output")
+		}
+	}
+
+	// 关闭必须在有限时间返回。
+	closed := make(chan struct{})
+	go func() { _ = p.Close(); close(closed) }()
 	select {
-	case <-over:
-	case <-time.After(time.Second):
-		t.Fatal("blocked ingest did not unblock on cancel")
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked with unconsumed legacy output")
 	}
-	t.Logf("backpressure verified: queue cap=%d, producer blocked then released", cap(p.in))
 }
 
 // TestBoundedFeederGoroutines 验证流量突增时投递 goroutine 数等于分区数，

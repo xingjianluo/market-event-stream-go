@@ -84,18 +84,23 @@ type barrierReq struct {
 // Processor 是事件流处理管线：单 goroutine 串行持有全部状态，
 // 输入侧为有界队列，输出侧为有界通道，提供检查点与恢复能力。
 type Processor struct {
-	cfg             Config
-	partitions      []int
-	in              chan inMsg
-	results         chan WindowResult
-	rejections      chan LateRejection
-	verdicts        chan Verdict
-	done            chan struct{}
-	stopCh          chan struct{}
-	closedOnce      sync.Once
-	logger          *slog.Logger
-	disableIdleTick bool // 测试中使用虚拟时钟时关闭墙钟自动空闲检测
-	store           *ResultStore
+	cfg              Config
+	partitions       []int
+	in               chan inMsg
+	results          chan WindowResult
+	rejections       chan LateRejection
+	verdicts         chan Verdict
+	done             chan struct{}
+	relayDone        chan struct{} // 旧结果接力 goroutine 退出信号
+	rejectRelayDone  chan struct{} // 侧输出接力 goroutine 退出信号
+	verdictRelayDone chan struct{} // 判定接力 goroutine 退出信号
+	stopCh           chan struct{}
+	closedOnce       sync.Once
+	logger           *slog.Logger
+	disableIdleTick  bool // 测试中使用虚拟时钟时关闭墙钟自动空闲检测
+	store            *ResultStore
+	rejBox           *boundedMailbox[LateRejection]
+	verdictBox       *boundedMailbox[Verdict]
 
 	// 以下字段仅由处理循环 goroutine 访问。
 	tracker   *WatermarkTracker
@@ -112,22 +117,27 @@ func NewProcessor(cfg Config, partitions []int) (*Processor, error) {
 		return nil, err
 	}
 	p := &Processor{
-		cfg:        cfg,
-		partitions: append([]int(nil), partitions...),
-		in:         make(chan inMsg, cfg.InputQueueCapacity),
-		results:    make(chan WindowResult, cfg.ResultBufferSize),
-		rejections: make(chan LateRejection, cfg.RejectBufferSize),
-		verdicts:   make(chan Verdict, cfg.RejectBufferSize),
-		done:       make(chan struct{}),
-		logger:     cfg.Logger,
-		tracker:    NewWatermarkTracker(partitions, cfg.MaxOutOfOrderness, cfg.IdleTimeout),
-		dedup:      NewDedupTable(),
-		windows:    make(map[WindowKey]*Window),
-		finalized:  make(map[WindowKey]bool),
-		positions:  make(map[int]int64),
-		wm:         NoWatermark,
-		stopCh:     make(chan struct{}),
-		store:      NewResultStore(cfg.ResultHistoryCapacity),
+		cfg:              cfg,
+		partitions:       append([]int(nil), partitions...),
+		in:               make(chan inMsg, cfg.InputQueueCapacity),
+		results:          make(chan WindowResult, cfg.ResultBufferSize),
+		rejections:       make(chan LateRejection, cfg.RejectBufferSize),
+		verdicts:         make(chan Verdict, cfg.RejectBufferSize),
+		done:             make(chan struct{}),
+		logger:           cfg.Logger,
+		tracker:          NewWatermarkTracker(partitions, cfg.MaxOutOfOrderness, cfg.IdleTimeout),
+		dedup:            NewDedupTable(),
+		windows:          make(map[WindowKey]*Window),
+		finalized:        make(map[WindowKey]bool),
+		positions:        make(map[int]int64),
+		wm:               NoWatermark,
+		stopCh:           make(chan struct{}),
+		relayDone:        make(chan struct{}),
+		rejectRelayDone:  make(chan struct{}),
+		verdictRelayDone: make(chan struct{}),
+		store:            NewResultStore(cfg.ResultHistoryCapacity),
+		rejBox:           newBoundedMailbox[LateRejection](sideOutputMailboxCapacity),
+		verdictBox:       newBoundedMailbox[Verdict](verdictMailboxCapacity),
 	}
 	for _, id := range partitions {
 		p.positions[id] = 0
@@ -141,6 +151,15 @@ func NewProcessor(cfg Config, partitions []int) (*Processor, error) {
 // 不会随分区数产生 goroutine；IdleTimeout=0 时关闭空闲检测。
 func (p *Processor) Start(ctx context.Context) error {
 	go p.loop(ctx)
+	// 唯一的旧输出接力：把权威结果历史（订阅面）按位点顺序搬运到原有 Results()
+	// 通道。它从存储拉取而非由处理循环推送，因此处理循环绝不依赖旧输出被消费；
+	// 只有一个接力 goroutine，不随结果数/订阅数增长。
+	go p.legacyRelay(ctx)
+	// 侧输出接力：把有界暂存的超宽限迟到事件搬运到原有 Rejections() 通道，
+	// 处理循环只做非阻塞入暂存，绝不因侧输出无人消费而停住。
+	go p.rejectionRelay(ctx)
+	// 判定接力：把逐条判定从有界暂存搬运到原有 Verdicts() 通道（纯可观测性旁路）。
+	go p.verdictRelay(ctx)
 	if p.cfg.IdleTimeout > 0 && !p.disableIdleTick {
 		interval := p.cfg.IdleTimeout / 4
 		if interval <= 0 {
@@ -195,6 +214,144 @@ func (p *Processor) loop(ctx context.Context) {
 			case msg.ev != nil:
 				p.handleEvent(ctx, *msg.ev, msg.ingestTime)
 			}
+		}
+	}
+}
+
+// legacyRelay 是唯一负责向原有 Results() 通道投递结果的 goroutine：
+// 它以独立游标从权威结果历史（与订阅面同一来源）按位点顺序拉取。
+//   - 处理循环只负责 Append 到有界历史，绝不阻塞在旧通道上，因此"只用订阅面、
+//     完全不消费旧输出"也不会卡住结果产生、屏障/快照或关闭；
+//   - 旧输出消费者停滞时，只有本接力 goroutine 停在通道发送上，处理循环继续；
+//     积压全部由有界历史承载（内存有界、无每订阅者任务）；
+//   - 若接力落后到游标已滑出有界历史（旧消费者停滞后突发结果超过保留容量），
+//     它放弃这些已不可回放的旧结果、跳到当前最旧位点继续，旧通道语义退化为
+//     "尽力而为"；权威、不丢不漏的结果面是订阅（ResultStore）。
+//
+// 正常关闭（存储关闭）时它排空仍在保留范围内的剩余结果后关闭 Results 通道；
+// 强制停止（stopCh，旧输出长期停滞导致优雅关闭超时）时立即放弃并关闭，
+// 避免 Close 被永久拖住。
+func (p *Processor) legacyRelay(ctx context.Context) {
+	defer func() {
+		close(p.results)
+		close(p.relayDone)
+	}()
+	cursor := ResultSeq(0) // 下一条待搬运位点
+	var lastGen uint64     // 上次观察到的结果流代号
+	for {
+		oldest, latest, gen, storeClosed := p.store.relayState()
+		if cursor == 0 || gen != lastGen {
+			// 首次启动，或结果流在恢复后被 Reset（位点回到新流起点）：从当前最旧位点开始。
+			cursor = oldest
+			lastGen = gen
+		} else if cursor < oldest {
+			// 旧消费者停滞过久，游标滑出有界历史：放弃已裁剪结果，跳到最旧位点。
+			p.logger.Warn("legacy results channel lagged beyond retained history; skipped expired results",
+				"from", cursor, "to", oldest)
+			cursor = oldest
+		}
+		// 注意：cursor==latest+1（已追上、等待新结果）时绝不能因为 cursor>latest 而
+		// 回退游标，否则关闭唤醒（无新追加）会把已投递结果重发一遍。
+		for cursor <= latest {
+			rec, ok := p.store.recordAt(cursor)
+			if !ok {
+				// 搬运期间状态变化：若是恢复导致的流重置，跳出内层、由外层按新代号
+				// 重新对齐（此时外层 latest 已过期，不能继续用它做内层条件）；
+				// 否则只是记录被环形裁剪，跳到当前最旧位点继续。
+				if _, _, gen2, _ := p.store.relayState(); gen2 != lastGen {
+					lastGen = gen2
+					break
+				}
+				oldest, _, _, _ = p.store.relayState()
+				cursor = oldest
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.stopCh:
+				return
+			case p.results <- rec.Result:
+				cursor++
+			}
+		}
+		if storeClosed {
+			return
+		}
+		// 先登记等待通道再复查状态，避免与 Append 的"关闭并换新"竞争后永久等待。
+		waitCh := p.store.notifyChan()
+		if _, latest2, gen2, closed2 := p.store.relayState(); closed2 || gen2 != lastGen || latest2 >= cursor {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stopCh:
+			return
+		case <-waitCh:
+		}
+	}
+}
+
+// rejectionRelay 把侧输出有界暂存搬运到原有 Rejections() 通道。它是唯一向该通道
+// 发送的 goroutine；处理循环的入暂存为非阻塞，因此侧输出无人消费也不会卡住处理
+// 链路。停滞的读者只会让本接力停在发送上（唯一额外 goroutine，有界）。
+// 处理器关闭（stopCh/ctx）后立即退出；剩余未投递的最旧侧输出可能被暂存覆盖，
+// 但每条侧输出都同时写入结构化日志，语义不静默丢失。
+func (p *Processor) rejectionRelay(ctx context.Context) {
+	runSideRelay(ctx, p.stopCh, p.done, p.rejBox, p.rejections, p.rejectRelayDone)
+}
+
+// verdictRelay 把判定暂存搬运到原有 Verdicts() 通道；语义与侧输出接力相同。
+func (p *Processor) verdictRelay(ctx context.Context) {
+	runSideRelay(ctx, p.stopCh, p.done, p.verdictBox, p.verdicts, p.verdictRelayDone)
+}
+
+// runSideRelay 是侧输出/判定接力的通用实现：先登记通知再排空暂存（避免漏唤醒），
+// 把每条送到对应通道；处理循环退出（loopDone 关闭）后排空最后一批再关闭通道并标记 done。
+// 停滞的读者只会让本 goroutine 停在发送上；Close 会在有限时间后通过 stop 强制收尾。
+// 后台接力数量固定（侧输出、判定各一个），不随事件数/订阅数增长。
+func runSideRelay[T any](ctx context.Context, stop, loopDone <-chan struct{},
+	box *boundedMailbox[T], out chan T, done chan struct{}) {
+	defer func() {
+		close(out)
+		close(done)
+	}()
+	send := func(v T) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-stop:
+			return false
+		case out <- v:
+			return true
+		}
+	}
+	for {
+		ch := box.notifyChan()
+		batch := box.drain()
+		for _, v := range batch {
+			if !send(v) {
+				return
+			}
+		}
+		if len(batch) > 0 {
+			continue // 连续排空
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-loopDone:
+			// 处理循环已退出：排空最后一批后结束（之后不会再入队）。
+			for _, v := range box.drain() {
+				if !send(v) {
+					return
+				}
+			}
+			return
+		case <-ch:
 		}
 	}
 }
@@ -377,6 +534,11 @@ func (p *Processor) purgeExpiredWindows(ctx context.Context) {
 				slog.String("window", k.String()), slog.Int64("boundary", boundary))
 		}
 	}
+	// 注意：这里不裁剪订阅面的结果物化视图。处理循环清除窗口状态是为了释放"可能再
+	// 被迟到事件更新"的计算状态；但窗口的最终结果仍属于下游需要恢复的物化视图，
+	// 一旦清除，落后到增量历史之外的订阅者将无法靠快照补回该窗口。视图按"每个窗口
+	// 一条最新结果"独立保留（规模 = 不同窗口数，与下游物化表同界，不随结果条数增长），
+	// 与按条数裁剪的增量历史（ring）相互独立。
 	if n := p.dedup.PurgeBefore(p.wm, p.cfg.AllowedLateness); n > 0 {
 		p.logger.LogAttrs(ctx, slog.LevelDebug, "dedup table pruned",
 			slog.Int("removed", n), slog.Int("remaining", p.dedup.Len()))
@@ -546,16 +708,24 @@ func (p *Processor) Restore(cp *Checkpoint) error {
 	p.wm = cp.Watermark
 	// 恢复后的进程相当于一次新的结果流：位点序列从 1 重新编号，
 	// 结果历史与物化视图清空，避免与崩溃前进程的记录混叠。
+	// 原地 Reset（而非替换指针）保证输出接力与已建立引用仍然有效、无数据竞争。
 	// 消费位点语义是进程内的；持久化跨进程续读由订阅者在取快照后续读。
-	p.store = NewResultStore(p.cfg.ResultHistoryCapacity)
+	p.store.Reset(p.cfg.ResultHistoryCapacity)
+	// 旁路暂存同样视为新进程的一部分，清空崩溃前残留。
+	p.rejBox.reset()
+	p.verdictBox.reset()
 	p.logger.Info("processor restored from checkpoint",
 		"watermark", wmString(cp.Watermark), "windows", len(p.windows), "dedup", p.dedup.Len())
 	return nil
 }
 
 // Close 优雅关闭：优先把 shutdown 排入有界输入队列（排空已入队事件）；
-// 若处理循环正停滞在无人消费的输出通道上导致 shutdown 无法入队，则关闭 stopCh
-// 强制解除输出阻塞并停止循环。两种路径都会等待循环退出后关闭全部输出通道。
+// 若处理循环停滞（例如下游只消费侧输出）导致 shutdown 无法及时入队，则关闭
+// stopCh 强制解除阻塞并停止循环。结果登记到订阅历史从不依赖旧输出被消费，
+// 因而即使没有任何下游读取 Results/Rejections/Verdicts，关闭也能在有限时间完成。
+//
+// 关闭顺序：先停处理循环，再关闭结果历史（接力 goroutine 排空保留范围内剩余
+// 结果后由它关闭 Results），等待接力退出，最后关闭侧输出与判定通道。
 func (p *Processor) Close() error {
 	p.closedOnce.Do(func() {
 		select {
@@ -566,12 +736,25 @@ func (p *Processor) Close() error {
 			p.stopCancelFn()
 			<-p.done
 		}
-		close(p.results)
-		close(p.rejections)
-		close(p.verdicts)
-		// 关闭结果订阅存储：所有订阅被唤醒，排空保留范围内剩余结果后收到 io.EOF，
-		// 即使订阅者从不读取，也没有任何后台任务需要回收（拉模型无每订阅者 goroutine）。
+		// 关闭权威结果历史：唤醒结果接力与所有订阅者。接力排空剩余结果后自行退出；
+		// 若它正停滞在无人消费的旧通道上，则在有限时间内强制放弃，保证 Close 返回。
 		p.store.Close()
+		select {
+		case <-p.relayDone:
+		case <-time.After(gracefulCloseTimeout):
+			p.stopCancelFn()
+			<-p.relayDone
+		}
+		// 侧输出/判定接力在处理循环退出（p.done）后排空剩余暂存并自行退出；
+		// 若停滞在无人消费的通道上（已 stopCh），同样有限时间强制收尾。
+		for _, d := range []chan struct{}{p.rejectRelayDone, p.verdictRelayDone} {
+			select {
+			case <-d:
+			case <-time.After(gracefulCloseTimeout):
+				p.stopCancelFn()
+				<-d
+			}
+		}
 	})
 	return nil
 }
@@ -579,6 +762,14 @@ func (p *Processor) Close() error {
 // gracefulCloseTimeout 是向下游输出排空 shutdown 的最长等待；
 // 超时说明下游已停滞，转入强制停止。
 const gracefulCloseTimeout = 250 * time.Millisecond
+
+// 旁路（侧输出/判定）的有界暂存容量：足够吸收正常调度抖动，使"总体在消费"的
+// 下游能收到全部条目；同时严格有界，完全停滞的读者不会让内存无限增长
+// （超容覆盖最旧条目，判定/侧输出同时写入结构化日志，不静默丢失语义）。
+const (
+	sideOutputMailboxCapacity = 4096
+	verdictMailboxCapacity    = 4096
+)
 
 // stopCancelFn 关闭 stopCh（仅一次），解除所有停滞在输出发送上的操作。
 func (p *Processor) stopCancelFn() {
@@ -638,13 +829,12 @@ func (p *Processor) CurrentWatermark(ctx context.Context) (int64, error) {
 	return cp.Watermark, nil
 }
 
-func (p *Processor) emitVerdict(ctx context.Context, v Verdict) {
-	select {
-	case <-ctx.Done():
-	case <-p.stopCh:
-	case p.verdicts <- v:
-	}
-	p.logger.LogAttrs(ctx, slog.LevelInfo, "event decision",
+// emitVerdict 输出逐条判定到有界暂存（O(1)、不阻塞处理循环），由判定接力搬运到
+// Verdicts() 通道；判定同时写入结构化日志。暂存满（下游完全停滞）时覆盖最旧一条，
+// 属纯可观测性旁路，绝不阻塞或拖垮处理链路。
+func (p *Processor) emitVerdict(_ context.Context, v Verdict) {
+	p.verdictBox.enqueue(v)
+	p.logger.LogAttrs(context.Background(), slog.LevelInfo, "event decision",
 		slog.String("event", v.Event.String()),
 		slog.String("decision", string(v.Decision)),
 		slog.Int64("eventTime", v.Event.EventTime),
@@ -654,24 +844,20 @@ func (p *Processor) emitVerdict(ctx context.Context, v Verdict) {
 		slog.String("reason", v.Reason))
 }
 
-func (p *Processor) sendResult(ctx context.Context, r WindowResult) {
-	select {
-	case <-ctx.Done():
-	case <-p.stopCh:
-	case p.results <- r:
-		// 仅在结果确已交付到旧输出面（Results 通道）后再登记到订阅历史，
-		// 保证两个输出面看到的结果集合一致，订阅历史不会多出"未交付"结果。
-		// 追加为 O(1) 且不阻塞，慢订阅者的等待不影响处理循环。
-		p.store.Append(r)
-	}
+// sendResult 登记一条窗口结果到权威结果历史（订阅面），并立即返回：Append 为
+// O(1) 且不阻塞，处理循环不依赖任何下游是否读取。原有 Results() 通道由唯一的
+// 接力 goroutine 从历史按位点搬运，因而慢订阅者、完全不读旧输出的订阅者或
+// 突发结果量都不会卡住处理链路；历史有界裁剪，内存与后台任务都有界。
+func (p *Processor) sendResult(_ context.Context, r WindowResult) {
+	p.store.Append(r)
 }
 
-func (p *Processor) sendRejection(ctx context.Context, r LateRejection) {
-	select {
-	case <-ctx.Done():
-	case <-p.stopCh:
-	case p.rejections <- r:
-	}
+// sendRejection 把超宽限迟到事件记入侧输出：处理循环只做一次 O(1) 的非阻塞入暂存，
+// 由唯一的侧输出接力 goroutine 搬运到原有 Rejections() 通道。下游不读取侧输出也
+// 不会卡住处理链路；暂存有界，超出后覆盖最旧条目（每条侧输出都同时写结构化日志，
+// 语义不静默丢失）。
+func (p *Processor) sendRejection(_ context.Context, r LateRejection) {
+	p.rejBox.enqueue(r)
 }
 
 // wmString 格式化水位线（含 ±∞ 语义），供日志阅读。

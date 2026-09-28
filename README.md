@@ -75,8 +75,14 @@ go test -race -count=1 -v ./...
 - 单 goroutine 串行持有全部窗口/水位线/去重/偏移状态，无共享可变状态、无细粒度锁。
 - 输入是容量为 `InputQueueCapacity` 的**有界队列**：队列满时上游 `Ingest` 阻塞，
   自然形成背压，慢消费者或流量突增不会造成内存或 goroutine 无界增长。
-- 结果/侧输出/判定均为**有界通道**；下游停滞时处理循环阻塞在发送上，进而使
-  输入队列填满并反压到生产者。
+- **结果/侧输出/判定与处理循环解耦（关键）**：处理循环只把结果以 O(1)、**绝不阻塞**的方式
+  写入有界结果历史（订阅面），把侧输出、逐条判定写入各自的有界暂存邮箱；再由**固定的
+  三个**接力 goroutine（结果、侧输出、判定各一个）从这些有界存储搬运到原有
+  `Results()` / `Rejections()` / `Verdicts()` 通道。
+  因此下游**只使用结果订阅面、完全不消费原有实时输出**时，处理循环也不会停住：
+  窗口结果持续产生、订阅按位点继续交付，取快照/检查点/当前状态以及 `Close()`
+  都能在有限时间内完成。停滞的旧通道消费者只会让对应的接力 goroutine 停在发送上
+  （接力数量固定为 3，不随订阅数/结果数增长），积压全部由有界存储承载。
 - `Feed` 为每个分区启动一个投递 goroutine（数量恒等于分区数，不随事件数增长），
   分区内严格保序，读完自动 `MarkComplete`。
 - 处理时间通过 `Clock` 接口注入；测试用虚拟时钟确定性驱动空闲超时，无 `sleep` 竞态。
@@ -139,21 +145,43 @@ go test -race -count=1 -v ./...
 
 ### 6.4 有界回放、溢出与恢复
 
-- 结果历史按 **条数** 有界（`ResultHistoryCapacity`），用定容环形缓冲保留最近 N 条；
-  物化视图随环形覆盖同步裁剪，**内存与后台任务不随运行时间增长**。
-- 订阅是拉模型且 `Append` 为 O(1) 非阻塞：**慢订阅者或突发流量不会阻塞处理管线**，
-  也不会产生每订阅者队列/goroutine。
-- 订阅者落后到 `after+1` 已滑出保留范围时，`SubscribeResults` / `Receive` 返回
-  **明确且可区分的哨兵错误 `ErrResultPositionExpired`**（区别于 `io.EOF`、
-  `context.Canceled`、`ErrSubscriptionClosed`）。**绝不静默漏掉或跳过结果**；
-  恢复方式唯一且确定：重新 `ResultSnapshot()` 取新视图，应用后从 `snap.Seq` 续读。
+结果存储由两部分**相互独立**的状态组成，背压/容量语义据此区分：
+
+| 状态 | 内容 | 容量上界 | 作用 |
+|------|------|----------|------|
+| 环形增量历史 `ring` | 最近 N 条结果（N=`ResultHistoryCapacity`） | **严格 N 条**，突发再多也只占定长内存 | 订阅者按位点**增量回放** |
+| 每窗口物化视图 `view` | 每个窗口的**最新结果**（FINAL 或最新 UPDATE） | **不同窗口数**（每窗口恰一条），不随结果条数/更正次数增长 | `ResultSnapshot()` 快照恢复 |
+
+- **只走订阅面即可独立工作**：处理循环只做 O(1) 的非阻塞追加，不依赖任何下游是否
+  读取原有 `Results()`/`Rejections()`。因此只使用结果订阅、完全不消费原有实时输出时：
+  - 窗口结果持续产生，订阅按位点严格继续交付；
+  - 慢订阅者、完全不读的订阅者、突发结果量都**不会拖垮处理链路**；
+  - 同时刻取快照、检查点、读当前水位线以及 `Close()` 都能在**有限时间内返回**；
+  - 后台任务有界：除处理循环外，只有**固定 3 个**输出接力 goroutine（结果/侧输出/判定，
+    与订阅数无关），订阅本身是纯拉取游标，不建立每订阅者 goroutine/队列。
+- **溢出结论明确可区分、可恢复**：订阅者落后到 `after+1` 已滑出**环形增量历史**时，
+  `SubscribeResults` / `Receive` 返回哨兵错误 `ErrResultPositionExpired`
+  （区别于 `io.EOF`、`context.Canceled`、`ErrSubscriptionClosed`），**绝不静默漏/跳结果**。
+  恢复方式唯一且确定：重新 `ResultSnapshot()` 取完整物化视图（视图保留了每窗口最新值，
+  即使该窗口的结果早已被环形历史裁剪也仍在视图中），应用视图后从 `snap.Seq` 续读增量。
+  物化视图与下游结果表同构（每窗口一条），其规模随不同窗口数有界；若嵌入方有更持久的
+  物化存储或按保留期回收的需要，可在外部确认后调用 `ResultStore.PruneView(boundary)`
+  主动做时间界回收（`Processor` 默认不回收，以保证快照始终可完整恢复）。
+- 慢订阅者停滞时只有旧输出接力 goroutine 停在通道发送上；若旧 `Results()` 通道长期
+  无人消费、积压超过环形容量，接力会跳过已被裁剪的旧结果继续搬运（旧通道退化为
+  "尽力而为"），而**权威、不丢不漏的结果面是订阅（ResultStore）**。
+- 侧输出（`Rejections()`，超宽限迟到事件）与逐条判定（`Verdicts()`）同样通过各自的
+  有界暂存邮箱 + 单一接力投递，不阻塞处理循环。邮箱容量较大（默认 4096），足以吸收
+  正常调度抖动，使"总体在消费"的下游收到全部条目；完全停滞的读者超出容量后最旧条目
+  被覆盖（侧输出/判定都同时写入结构化日志，不静默丢失语义）。
 - 即使订阅者**完全不读**，管线也能在有限时间内推进屏障并被 `Close()` 正常停止、
-  完成资源回收（无后台任务需要回收）；存储关闭后，订阅者排空保留范围内剩余结果，
-  最终收到 `io.EOF`。
+  完成资源回收（无每订阅者后台任务需要回收）；存储关闭后，订阅者排空保留范围内剩余
+  结果，最终收到 `io.EOF`。
 - 位点序列是**进程内**的：处理器从检查点 `Restore` 后，结果流视为新流（位点从 1
-  重新编号，历史清空），跨进程续读同样走"取快照 → 从快照位点续读"。
-- 注意：使用订阅面时仍应消费原有 `Results()` 通道（原通道保持有界背压语义不变）；
-  订阅历史在结果交付到原通道后登记，两个输出面看到的结果集合与顺序一致。
+  重新编号，历史/视图/侧输出暂存清空），跨进程续读同样走"取快照 → 从快照位点续读"。
+- **两个输出面可独立使用**：原有 `Results()` 通道由接力从同一结果历史按位点搬运，
+  保持有界通道形态；订阅历史是权威来源，不再要求"必须消费原通道"。同时使用两个面时，
+  它们看到的结果集合与顺序一致（旧通道在极端停滞下为尽力而为，权威结论以订阅面为准）。
 
 ## 七、可配置项（`Config`）
 
@@ -166,7 +194,7 @@ go test -race -count=1 -v ./...
 | `InputQueueCapacity` | 条数 | 256 | 输入有界队列长度（背压阈值） |
 | `ResultBufferSize` | 条数 | 64 | 窗口结果通道缓冲 |
 | `RejectBufferSize` | 条数 | 64 | 侧输出/判定通道缓冲 |
-| `ResultHistoryCapacity` | 条数 | 1024 | 结果订阅历史保留条数（环形有界）；为 0 用默认值，落后超出返回 `ErrResultPositionExpired` |
+| `ResultHistoryCapacity` | 条数 | 1024 | 订阅面**环形增量历史**保留条数（定长有界）；为 0 用默认值。落后超出该范围返回 `ErrResultPositionExpired`，改取快照恢复。注意它只约束"增量回放"，不约束按窗口保留的快照物化视图 |
 | `Clock` | — | 系统时钟 | 处理时间来源（可注入虚拟时钟） |
 | `Logger` | — | stdout | `slog` 结构化日志 |
 
@@ -179,8 +207,9 @@ go test -race -count=1 -v ./...
 | `watermark.go` | 分区/全局水位线追踪、空闲与完成处理 |
 | `dedup.go` | 事件级幂等去重与有界裁剪 |
 | `source.go` | 内存分区事件源，支持偏移 `Seek` 回放（带锁，可并发分区读取） |
-| `processor.go` | 串行处理循环、判定、窗口触发、背压、屏障、恢复、输出通道、结果订阅入口 |
-| `subscription.go` | 有界结果历史、稳定位点订阅、快照物化视图、溢出结论与订阅者侧结果应用器 |
+| `processor.go` | 串行处理循环、判定、窗口触发、背压、屏障、恢复、结果订阅入口，以及把结果历史/侧输出/判定暂存搬运到原有通道的固定接力 goroutine |
+| `subscription.go` | 有界环形增量历史 + 每窗口物化视图、稳定位点订阅、快照、溢出结论与订阅者侧结果应用器 |
+| `mailbox.go` | 旁路输出（侧输出/判定）用的泛型有界暂存邮箱：入队非阻塞、接力无轮询唤醒 |
 | `checkpoint.go` | 检查点结构、JSON 原子持久化与 ID 编解码 |
 | `config.go` / `clock.go` | 配置校验与时钟抽象 |
 | `cmd/demo/main.go` | 端到端演示 |
@@ -188,8 +217,44 @@ go test -race -count=1 -v ./...
 ## 九、本地验证与测试场景
 
 ```bash
+# 全量（含竞态检测）
 go test -race -count=1 -v ./...
+
+# 稳定性：重复运行确认无调度相关抖动（订阅/接力已全部改为确定性同步或显式等待）
+go test -race -count=20 ./...
+
+# 只跑"只用订阅面、不消费原有输出"相关用例
+go test -race -count=5 -run 'SubscriptionOnly|NonReading|Overflow|Reconnect|Burst|SlowSubscriber|FiniteStop' ./...
+
+# 端到端演示
+go run ./cmd/demo
 ```
+
+**只使用结果订阅面（不消费 `Results()`）的最小用法**：
+
+```go
+sub, _ := p.SubscribeResults(lastAck) // lastAck=0 即从头订阅
+for {
+    rec, err := sub.Receive(ctx)
+    switch {
+    case errors.Is(err, ErrResultPositionExpired):
+        snap, _ := p.ResultSnapshot(ctx)        // 落后太多：取完整快照
+        for _, v := range snap.Views { apply(v) }
+        sub, _ = p.SubscribeResults(snap.Seq)   // 再从快照位点续读增量
+        lastAck = snap.Seq
+        continue
+    case errors.Is(err, io.EOF):
+        return                                  // 处理器已优雅关闭
+    case err != nil:
+        return
+    }
+    apply(rec.Result)
+    lastAck = sub.Ack()                         // 可持久化的确认位点（幂等）
+}
+```
+
+该用法下无需启动任何 `Results()`/`Rejections()`/`Verdicts()` 消费者：处理循环、
+屏障与关闭都不依赖它们被排空。
 
 覆盖场景与失败可区分性：
 
@@ -216,6 +281,22 @@ go test -race -count=1 -v ./...
   - `TestSubscriptionStreamConsistentAcrossOrders` /
     `TestSubscribeAfterCheckpointReplayMatchesFaultFree`：不同分区交错、不同批大小、
     故障重放下订阅面的每窗口最终结论严格一致。
+- 只用订阅面、完全不消费原有输出（`subscription_only_test.go`）：
+  - `TestSubscriptionOnlyDeliversBeyondDefaultCapacity`：边产生边消费，结果量超过
+    默认容量后订阅仍按位点严格交付；
+  - `TestNonReadingLegacyOutputDoesNotBlockSubscription` /
+    `TestSubscriptionOnlyBarriersAndCloseAreFinite`：完全不读旧输出时，订阅持续交付、
+    快照/检查点/关闭都在有限时间返回；
+  - `TestBoundedResourcesWithNonReadingDownstream` /
+    `TestNonReadingSubscriberBoundedTasks`：完全不读者与大量空闲订阅者下历史/队列/
+    goroutine 严格有界，落后者收到可区分的溢出结论；
+  - `TestOverflowRecoverySnapThenIncremental`：环形增量历史已裁剪的窗口仍能由快照视图
+    恢复，快照 + 增量与持续消费逐窗口逐字段（身份/类型/聚合/位点）一致；
+  - `TestReconnectStrictFromAckAndRedelivery`：掉线严格按最后 Ack 续读、更正链保序、
+    重复确认/重复补发只生效一次；
+  - `TestSubscriptionOnlyMultiPartitionBatchesStrictEqual` /
+    `TestSubscriptionOnlyRepeatedRunsStable` / `TestBurstResultsDoNotBlockPipeline`：
+    不同分区交错、不同批大小、突发结果量下结论严格一致且多次运行稳定。
 
 所有测试通过 `slog` 打印水位线（含 `-inf/+inf`）、事件时间、窗口与判定原因，
 失败断言会指出具体不一致的窗口、聚合字段或判定类别，便于区分根因。

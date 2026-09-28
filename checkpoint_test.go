@@ -77,6 +77,13 @@ func TestCheckpointRestoreReplayEqualsFaultFree(t *testing.T) {
 	done := p2.Feed(ctx, src)
 	<-done
 	waitForResults(t, col2, 2)
+	// 屏障确保所有已投递事件（含重放事件）都已被串行循环处理、判定已发出；
+	// 接力投递结果是异步的，收到结果数不再等价于"全部入队事件处理完毕"。
+	if _, err := p2.Checkpoint(ctx); err != nil {
+		t.Fatalf("barrier after recovery feed: %v", err)
+	}
+	// 恢复后实际处理：p0 重放 1 条（DUPLICATE）+ p1 剩余 2 条 = 3 条判定。
+	waitForVerdicts(t, col2, 3)
 
 	got := make(map[WindowKey]Aggregate)
 	for k, r := range col2.finalResults() {

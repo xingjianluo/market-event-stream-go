@@ -80,6 +80,8 @@ func TestLateDataWithinAndBeyondGrace(t *testing.T) {
 	// #6 BTC t=2000 迟到且超宽限：窗口结束 10000 <= 15000 -> 侧输出 DROPPED_LATE
 	p.Ingest(ctx, mkEvent(0, 6, "BTC", 2_000, 400, 4))
 	p.MarkComplete(ctx, 0)
+	waitForResults(t, col, 3)    // FINAL BTC + 2 个 UPDATE BTC
+	waitForRejections(t, col, 1) // 侧输出通过接力异步投递，需显式等待
 	waitForVerdicts(t, col, 7)
 
 	byOffset := map[int64]Verdict{}

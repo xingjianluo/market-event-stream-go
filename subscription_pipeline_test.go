@@ -133,7 +133,10 @@ func TestProcessorSubscribeDisconnectReconnect(t *testing.T) {
 	final := recsToFinal(all)
 	assertSubFixtureFinal(t, final)
 
-	// 旧输出面与订阅面结果集合一致（条数与逐字段相等）。
+	// 旧输出面与订阅面结果集合一致（条数与逐字段相等）。旧通道由唯一接力 goroutine
+	// 从结果历史异步搬运，屏障保证结果已登记到历史、但不保证接力已投递，因此这里先
+	// 等待接力把全部结果投递完毕再比对（确定性，不依赖调度时序）。
+	waitForResults(t, col, len(all))
 	legacy := col.Results()
 	if len(legacy) != len(all) {
 		t.Fatalf("legacy results %d != subscription records %d", len(legacy), len(all))

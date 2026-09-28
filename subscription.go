@@ -53,12 +53,21 @@ var (
 	ErrSubscriptionClosed = errors.New("result subscription closed")
 )
 
-// ResultStore 是有界的结果历史与物化视图：处理循环单线程追加，
-// 任意多个订阅者以自带游标的方式无阻塞拉读（不为订阅者建立 goroutine
-// 或每订阅者队列，因而慢订阅者既不拖垮管线，也不会造成任务无界增长）。
+// ResultStore 由两部分相互独立的状态组成：
+//   - ring（定容环形历史）：保留最近 N 条结果，供订阅者按位点**增量回放**；
+//     落后超出该范围的订阅者收到 ErrResultPositionExpired。这是"增量回放"的有界点，
+//     突发再多结果也只占定长内存。
+//   - view（每窗口物化视图）：保留每个窗口的**最新结果**（FINAL 或最新 UPDATE），
+//     供快照恢复，不随环形覆盖而删除。它就是"当前物化结果状态"，与下游物化结果表
+//     同构：规模 = 不同窗口数（每窗口恰好一条），不随结果条数/更正次数增长；
+//     落后再多，也总能取一份完整快照后从快照位点续读，不丢任何窗口结果。
+//     仅嵌入方可通过 PruneView 按自身保留策略做时间界回收（Processor 默认不回收）。
+//
+// 处理循环单线程追加，任意多个订阅者以自带游标无阻塞拉读（不为订阅者建立
+// goroutine 或每订阅者队列，因而慢订阅者既不拖垮管线，也不会造成任务无界增长）。
 type ResultStore struct {
 	mu     sync.Mutex
-	ring   []ResultRecord // 定容环形缓冲，容量即历史保留条数
+	ring   []ResultRecord // 定容环形缓冲，容量即增量历史保留条数
 	head   int            // ring 中最旧记录的下标
 	count  int            // ring 中有效记录数
 	seq    ResultSeq      // 已分配的最大位点（空历史时为 0）
@@ -66,6 +75,7 @@ type ResultStore struct {
 	view   map[WindowKey]ResultRecord
 	notify chan struct{} // 每次追加/关闭时"关闭并换新"，实现无 goroutine 广播
 	closed bool
+	gen    uint64 // 结果流代号：每次 Reset（进程恢复）+1，用于接力识别"流已重置"
 }
 
 // NewResultStore 创建容量为 capacity 条结果的历史存储；capacity<=0 用默认容量。
@@ -79,6 +89,26 @@ func NewResultStore(capacity int) *ResultStore {
 		wm:     NoWatermark,
 		notify: make(chan struct{}),
 	}
+}
+
+// Reset 在原地清空全部历史、物化视图与位点（位点重新从 1 开始），并解除关闭态。
+// 与替换整个 *ResultStore 不同，Reset 不改变指针，输出接力等内部引用始终有效，
+// 因而可在 Start 之后调用而不引入数据竞争；等待中的订阅者会被唤醒。
+func (s *ResultStore) Reset(capacity int) {
+	if capacity <= 0 {
+		capacity = defaultResultHistoryCapacity
+	}
+	s.mu.Lock()
+	s.ring = make([]ResultRecord, capacity)
+	s.head = 0
+	s.count = 0
+	s.seq = 0
+	s.wm = NoWatermark
+	s.view = make(map[WindowKey]ResultRecord)
+	s.closed = false
+	s.gen++ // 标记结果流已重置，输出接力据此把游标对齐到新流起点
+	s.broadcastLocked()
+	s.mu.Unlock()
 }
 
 // oldestSeqLocked 返回当前最旧可交付位点；调用方持锁。
@@ -113,13 +143,8 @@ func (s *ResultStore) Append(r WindowResult) ResultRecord {
 	s.seq++
 	rec := ResultRecord{Seq: s.seq, Result: r}
 	if s.count == len(s.ring) {
-		// 环形已满：覆盖最旧记录。若该记录正是其窗口在视图中的最新值，
-		// 说明整个窗口都已滑出保留范围，同步把它从物化视图删除，
-		// 保证快照内容与"历史可重放范围"严格一致（内存有界）。
-		old := s.ring[s.head]
-		if cur, ok := s.view[old.Result.Window]; ok && cur.Seq == old.Seq {
-			delete(s.view, old.Result.Window)
-		}
+		// 环形已满：覆盖最旧的增量回放记录。物化视图不在这里删除——
+		// 视图按"窗口最新值"独立保留，落后再多也能靠快照恢复，不静默丢窗口。
 		s.ring[s.head] = rec
 		s.head = (s.head + 1) % len(s.ring)
 	} else {
@@ -136,7 +161,50 @@ func (s *ResultStore) Append(r WindowResult) ResultRecord {
 	return rec
 }
 
-// SnapshotLocked 取出当前位点的完整物化视图副本（确定性排序）；调用方持锁。
+// notifyChan 返回当前的"追加/关闭通知"通道：它在每次追加或关闭时被关闭并换新。
+// 供输出接力 goroutine 等待新结果，避免轮询与每订阅者 goroutine。
+func (s *ResultStore) notifyChan() <-chan struct{} {
+	s.mu.Lock()
+	ch := s.notify
+	s.mu.Unlock()
+	return ch
+}
+
+// recordAt 是 recordLocked 的导出包装（同包内供输出接力使用）。
+func (s *ResultStore) recordAt(seq ResultSeq) (ResultRecord, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recordLocked(seq)
+}
+
+// relayState 一次性读取接力所需的状态；调用方持锁。
+func (s *ResultStore) relayState() (oldest ResultSeq, latest ResultSeq, gen uint64, closed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.oldestSeqLocked(), s.seq, s.gen, s.closed
+}
+
+// PruneView 删除窗口结束时间 <= boundary 的物化视图条目。
+//
+// 注意：Processor 默认【不会】在清除计算窗口时调用它——窗口的 FINAL/最新结果仍属于
+// 下游需要恢复的物化视图，提前删除会让落后到增量历史之外的订阅者无法靠快照补回。
+// 视图按"每窗口一条最新结果"保留，规模 = 不同窗口数（与下游物化表同界）。
+// 仅当嵌入方明确知道某些窗口结果不再需要恢复（例如外部已确认物化到更持久的存储、
+// 或按保留期回收）时，才应主动调用本方法做时间界回收。
+func (s *ResultStore) PruneView(boundary int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k := range s.view {
+		if k.End <= boundary {
+			delete(s.view, k)
+			n++
+		}
+	}
+	return n
+}
+
+// snapshotLocked 取出当前位点的完整物化视图副本（确定性排序）；调用方持锁。
 func (s *ResultStore) snapshotLocked() *ResultSnapshot {
 	views := make([]ResultRecord, 0, len(s.view))
 	for _, rec := range s.view {

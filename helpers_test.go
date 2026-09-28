@@ -152,6 +152,22 @@ func waitForResults(t *testing.T, c *collector, n int) {
 	t.Fatalf("waitForResults timeout: got %d, want %d", len(c.Results()), n)
 }
 
+// waitForRejections 轮询等待收集到至少 n 条侧输出，超时即失败。
+func waitForRejections(t *testing.T, c *collector, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		got := len(c.rejections)
+		c.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("waitForRejections timeout: got %d, want %d", len(c.Rejections()), n)
+}
+
 // waitForVerdicts 轮询等待收集到至少 n 条判定。
 func waitForVerdicts(t *testing.T, c *collector, n int) {
 	t.Helper()

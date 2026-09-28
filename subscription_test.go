@@ -257,13 +257,29 @@ func TestStoreHistoryStrictlyBounded(t *testing.T) {
 		t.Fatalf("retained window = %+v", recs)
 	}
 
-	// 多窗口滑出后视图条数同样有界（<=容量）。
+	// 物化视图独立于环形增量历史：环形裁剪不删除窗口最新值，因此落后再多也能
+	// 取完整快照恢复；视图的有界性由处理循环按窗口清除边界调用 PruneView 保证。
 	s4 := NewResultStore(capN)
 	for i := 0; i < 20; i++ {
 		s4.Append(storeRec("S", int64(i)*10_000, ResultFinal, 1, 0))
 	}
-	if len(s4.Snapshot().Views) > capN {
-		t.Fatalf("view entries exceed capacity %d", capN)
+	if len(s4.Snapshot().Views) != 20 {
+		t.Fatalf("materialized view must retain every window latest value, got %d", len(s4.Snapshot().Views))
+	}
+	// 按窗口结束边界裁剪后视图有界：保留 End>100_000 的窗口（start>=100_000）。
+	pruned := s4.PruneView(100_000)
+	views := s4.Snapshot().Views
+	if pruned != 10 || len(views) != 10 {
+		t.Fatalf("PruneView removed=%d views=%d want 10/10", pruned, len(views))
+	}
+	for _, v := range views {
+		if v.Result.Window.End <= 100_000 {
+			t.Fatalf("expired window %s retained in snapshot view", v.Result.Window)
+		}
+	}
+	// 裁剪只影响视图，不影响环形增量历史与位点。
+	if s4.seq != 20 || s4.count != capN {
+		t.Fatalf("incremental history disturbed by PruneView: seq=%d count=%d", s4.seq, s4.count)
 	}
 }
 
